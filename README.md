@@ -2,108 +2,247 @@
 
 > **See the consequences before your agent acts.**
 
-Foresee is a simulation gateway between an AI agent and high-stakes write actions. For this challenge, it implements one production-grade adapter: destructive PostgreSQL customer deletion.
+Foresee is a safety gateway between an AI agent and high-stakes write actions. This challenge build implements one deep adapter: destructive PostgreSQL customer deletion.
 
-**Thesis:** Foresee does not ask an LLM to imagine the result of a database mutation. It runs the mutation against real PostgreSQL state inside a reversible transaction, measures the consequences, rolls it back, and only then asks a human for authority.
+**Core claim:** Foresee does not ask an LLM to imagine a mutation's consequences. It executes the candidate mutation against real PostgreSQL state inside a reversible transaction, measures the state transition, rolls it back, and only then asks a human for authority.
 
-## Challenge proof
+## Live demo
 
-The golden path intentionally starts unsafe. “Delete customers inactive for more than 12 months” selects 18 real rows, including one inactive customer that still has an active Enterprise subscription worth $2,400 MRR. The first simulation is HIGH risk. A one-click constrained tweak — **Exclude active subscriptions** — produces a new simulation: 17 rows, $0 protected MRR at risk, LOW risk. Simulation changed the decision.
+**https://br-falling-hill-b5dguwdc-foresee.compute.c-7.us-east-2.aws.neon.tech/**
 
-The failure test proves the world model is not omniscient. A hidden PostgreSQL trigger mutates `account_summary`; the bounded simulation does not observe that domain. During real execution, the broader runtime verifier sees the unexpected mutation and rolls the transaction back before commit.
+No login is required. Every browser receives an isolated UUID demo session with its own seeded business state. **Reset Demo** only resets that session.
+
+## Challenge proof in 60 seconds
+
+1. Submit **“Delete customers who have been inactive for more than 12 months.”**
+2. Foresee runs the real DELETE inside a PostgreSQL transaction, measures the consequences, and rolls it back.
+3. The first simulation finds **18 customers**, including one inactive Enterprise customer that still has an active subscription. Result: **HIGH risk / $2,400 protected MRR at risk**.
+4. Click **Exclude active subscriptions**. Foresee creates a new simulation: **17 customers / $0 protected MRR / LOW risk**.
+5. Approve the exact simulated plan. Foresee revalidates the state fingerprint, snapshots rollback data, executes inside a transaction, verifies observed reality, and commits only if the impact stays inside the approved envelope.
+6. Run **Failure Test**. A deliberately hidden PostgreSQL trigger changes `account_summary`. The simulation under-predicts the effect; the runtime verifier detects the divergence and automatically rolls the transaction back before commit.
+
+The simulation therefore **changes the decision** rather than merely describing it.
 
 ## Architecture
 
 ```text
-User / Agent → Intent Parser → Validated Action DSL → Simulation Engine → Human Review
-Simulation Engine: real PostgreSQL transaction + impact graph + policy/risk + rollback plan + fingerprint
-Human Review: Reject / Tweak / Approve
-Approve → Execution Gateway → Runtime Safety Net → Commit | Rollback
+User / Agent
+    ↓
+Intent Parser
+    ↓
+Validated Action DSL
+    ↓
+Simulation Engine
+    ├─ real PostgreSQL transaction
+    ├─ exact target rows
+    ├─ impact graph + before/after diff
+    ├─ policy + deterministic risk
+    ├─ uncertainty coverage
+    └─ rollback plan + state fingerprint
+    ↓
+Simulation Report
+    ↓
+Human Review ── Reject / Tweak / Approve
+    ↓
+Execution Gateway
+    ├─ immutable approved plan
+    ├─ row locking
+    ├─ fingerprint validation
+    └─ rollback journal
+    ↓
+Runtime Safety Net
+    ├─ observed impact matches → COMMIT
+    └─ material divergence → ROLLBACK
 ```
 
-Static snapshot: [`public/architecture.svg`](public/architecture.svg)
+Static submission asset: [`public/architecture.svg`](public/architecture.svg)
+
+## The action DSL
+
+The browser never sends arbitrary SQL. Natural-language intent is reduced to a constrained plan and validated with Zod:
+
+```json
+{
+  "action": "delete_customers",
+  "filters": {
+    "inactive_days": 365,
+    "exclude_active_subscriptions": false,
+    "exclude_enterprise": false,
+    "limit": null,
+    "chaos_case_only": false
+  }
+}
+```
+
+The server compiles this plan into fixed, parameterized PostgreSQL queries.
 
 ## How simulation actually works
 
-1. Intent maps to a constrained `delete_customers` DSL. The browser can never submit arbitrary SQL.
-2. The server validates the DSL with Zod and compiles fixed parameterized PostgreSQL queries.
-3. Foresee opens `REPEATABLE READ`, loads exact target rows, executes the candidate `DELETE`, measures state, and calls `ROLLBACK`.
-4. It computes an explainable risk result and coverage-based confidence.
-5. It stores a SHA-256 fingerprint of normalized plan, target keys, row timestamps, subscription state, and expiry.
-6. Approval sends only the simulation ID. The server reloads the immutable plan, locks relevant rows, recomputes the fingerprint, and rejects stale simulations.
-7. Known affected rows are serialized into a rollback journal before destructive execution.
-8. A broader post-action verifier compares candidate reality with the approved impact envelope. Match commits; divergence rolls back.
+1. Load the exact candidate rows from real database state.
+2. Compute the pre-action aggregate state.
+3. `BEGIN ISOLATION LEVEL REPEATABLE READ`.
+4. Execute the same destructive DELETE used by the real action.
+5. Measure customer, subscription, MRR, ticket, note, and aggregate impact.
+6. Build a row-level and aggregate before/after report.
+7. `ROLLBACK` so simulation leaves business state unchanged.
+8. Persist only the simulation report, policy result, expiry, and cryptographic fingerprint.
 
-## Safety architecture
+The fingerprint is SHA-256 over the normalized action plan plus relevant target primary keys, row timestamps, and subscription state. It expires after five minutes.
 
-- Constrained DSL; no browser SQL.
-- Real transaction simulation, not mock JSON.
-- Active subscriptions, protected MRR, and Enterprise accounts force HIGH risk.
-- Fingerprint + five-minute expiry prevents simulate-then-execute drift.
-- Execution trusts only the persisted plan for a simulation ID.
-- Rollback journal serializes customers and dependent rows before commit.
-- Runtime verification checks counts, MRR, subscription integrity, and the broader summary domain.
-- Each public reviewer gets an isolated UUID sandbox; reset affects only that session.
-- Authority transitions are persisted in the audit trail.
+## Preventing simulate-then-execute drift
+
+Approval sends **only the simulation ID**. The execution gateway does not trust a new plan from the browser.
+
+On approval Foresee:
+
+1. opens a `SERIALIZABLE` transaction,
+2. reloads and locks relevant rows,
+3. recomputes the simulation fingerprint,
+4. rejects stale simulations with **Re-simulation required**,
+5. serializes known affected rows into the rollback journal,
+6. executes the immutable approved mutation,
+7. runs broader post-action invariants,
+8. commits only if observed reality fits the approved envelope.
+
+## Explainable risk, not an AI score
+
+Risk is deterministic. HIGH is triggered by protected relationships such as an active subscription, protected MRR, Enterprise customers, or incomplete rollback coverage. MEDIUM captures material blast radius. LOW requires no protected relationships and complete known rollback coverage.
+
+Confidence is also not a fabricated probability. It summarizes observable coverage: transaction fidelity, schema visibility, rollback completeness, and whether effects may escape the observed dependency graph.
 
 ## Deterministic dataset
 
-Each session receives 1,024 customers. Eighteen are inactive beyond 365 days. Exactly one of those is an Enterprise customer with an active $2,400 subscription. Remaining active subscriptions bring total MRR to $87,400.
+Each public session receives:
+
+- 1,024 customers
+- 18 customers inactive for more than 365 days
+- exactly one inactive Enterprise customer with an active **$2,400 MRR** subscription
+- 42 Enterprise customers total
+- $87,400 active MRR
+- support tickets and 37 customer notes
+- one `Chaos Canary` customer used only by the failure test
+
+Expected golden transition:
 
 ```text
-Unsafe: Customers 1,024 → 1,006 | Enterprise 42 → 41 | MRR $87,400 → $85,000
-Tweaked: Customers 1,024 → 1,007 | Enterprise 42 → 42 | MRR $87,400 → $87,400
+Unsafe simulation
+Customers             1,024 → 1,006   -18
+Enterprise customers     42 → 41       -1
+MRR                  $87,400 → $85,000 -$2,400
+Risk                                     HIGH
+
+After “Exclude active subscriptions”
+Customers             1,024 → 1,007   -17
+Enterprise customers     42 → 42         0
+MRR                  $87,400 → $87,400   $0
+Risk                                      LOW
 ```
 
-These values are computed from database state, not hardcoded presentation values.
+Those presentation values are computed from database state, not hardcoded into the report.
 
-## Failure test
+## Real rollback path
 
-`Chaos Canary` has a deliberately hidden `AFTER DELETE` trigger that decrements `foresee_account_summary.enterprise_customers`, a domain excluded from the bounded simulation model. The sandbox DELETE really fires the trigger, but the predicted envelope intentionally omits that mutation. During approved execution, the broader verifier sees the divergence, emits `RUNTIME_DIVERGENCE`, rolls back the transaction, and records `AUTO_ROLLBACK`. Persistent business state remains unchanged.
+Before destructive execution, Foresee journals the known customer, subscription, ticket, and note rows as serialized PostgreSQL records with restore order. **Rollback Execution** restores them in dependency-safe order. Execution status and its audit event are committed atomically with the business transaction.
+
+## Failure test: the world model is intentionally wrong once
+
+`Chaos Canary` has a real PostgreSQL `AFTER DELETE` trigger that unexpectedly decrements `foresee_account_summary.enterprise_customers`.
+
+The bounded simulation intentionally excludes that summary domain from its predicted dependency graph. During approved execution, the broader verifier compares the candidate post-action reality with the approved envelope and sees:
+
+```text
+Unexpected side effect: account_summary.enterprise_customers
+Safety response:       Transaction rolled back automatically
+Persistent state:      UNCHANGED
+```
+
+This is deliberate: Foresee assumes simulations are useful but imperfect. **Simulation predicts; runtime verification makes prediction safe.**
+
+## Auditability
+
+Significant authority transitions are persisted: `SIMULATION_STARTED`, `SIMULATION_COMPLETED`, `POLICY_BLOCKED`, `ACTION_TWEAKED`, `ACTION_APPROVED`, `STATE_FINGERPRINT_FAILED`, `EXECUTION_STARTED`, `RUNTIME_DIVERGENCE`, `AUTO_ROLLBACK`, `EXECUTION_COMMITTED`, `MANUAL_ROLLBACK`, and rejection events.
+
+## Production demo runtime
+
+The public demo is deployed as a **Neon Function** on an isolated Neon branch with a real PostgreSQL compute. `neon-function/index.ts` imports the same `lib/engine.ts`, DSL, risk, fingerprint, rollback, and database logic as the Next.js application; the live demo is not a separate mock implementation.
+
+The repository also contains the full Next.js App Router application and API routes for conventional hosting.
 
 ## Tech stack
 
-Next.js 15 App Router, React 19, strict TypeScript, PostgreSQL/Neon-compatible `pg`, Zod, Vitest, Playwright, Vercel Node runtime.
+- Next.js 15.5.24 Maintenance LTS + React 19
+- strict TypeScript
+- PostgreSQL / Neon
+- `pg`
+- Zod
+- Neon Functions (Node.js 24) for the public deployment
+- Vitest
+- Playwright
+- GitHub Actions
 
 ## Local setup
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/AnasAli09822/my-code.git simulate-before-you-act
 cd simulate-before-you-act
 npm install
 cp .env.example .env.local
-# set DATABASE_URL
+# Set DATABASE_URL to a PostgreSQL database you control.
 npm run dev
 ```
 
-Schema and seed creation are lazy on first request. The DB role needs permission to create tables, indexes, a PL/pgSQL function, and a trigger.
+Schema and deterministic seed creation happen lazily on first session request. The database role needs permission to create tables, indexes, a PL/pgSQL function, and its demo trigger.
 
 ## Tests
 
 ```bash
-npm test
 npm run typecheck
+npm test
 npm run build
 npm run test:e2e
 ```
 
-Coverage includes DSL validation, deterministic risk, fingerprint drift, transaction non-persistence, protected-customer detection, safe tweak execution, manual rollback, stale simulation blocking, and hidden-side-effect auto rollback.
+The suite covers:
 
-## 90-second demo
+- DSL acceptance/rejection
+- deterministic risk calculation
+- fingerprint determinism and state drift
+- simulation leaves persistent business state unchanged
+- protected Enterprise subscriber detection
+- safe tweak removes protected revenue
+- execution matches the approved simulation
+- stale simulation rejection
+- real rollback restoration
+- hidden side effect detection
+- automatic rollback with persistent state unchanged
+- browser-level golden path and failure path
 
-Exact narration and click path: [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md)
+CI validates strict typechecking, unit tests, production build, and Playwright against the public deployment. The deployment workflow additionally runs the real PostgreSQL integration suite plus HTTP smoke tests against the isolated Neon branch before considering the deployment verified.
+
+## 90-second walkthrough
+
+Exact narration and click sequence: [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md)
 
 ## AI tools used
 
-Development used ChatGPT / GPT-5.6 Sol for implementation and review. The live product does **not** require an LLM for the golden path; the intent parser uses a deterministic fallback so judges are not exposed to model rate limits. No model invents impact values.
+Development used **ChatGPT / GPT-5.6 Sol** for implementation, review, debugging, test design, and deployment orchestration. The live judge path does **not** depend on an LLM: its intent parser has a deterministic constrained path, so model rate limits cannot break the demo. No model invents impact values.
 
 ## Key decisions
 
-One deep adapter over several shallow ones; the database is the simulator; authority is granted to an immutable state transition; confidence represents coverage, not fabricated probability; runtime divergence handling is a first-class safety layer.
+- One deep destructive-database adapter instead of multiple shallow integrations.
+- The real database is part of the world model.
+- Human authority is granted to one immutable simulated state transition, not to a generic `DELETE` permission.
+- Uncertainty is explicit and coverage-based.
+- Runtime verification is a second safety layer, not an afterthought.
+- Recovery is real and tested, not a decorative rollback button.
 
-## Limitations / out of scope
+## Out of scope
 
-Arbitrary SQL, irreversible third-party APIs, complete modeling of unknown external integrations, general-purpose DB migration planning, and authentication. The challenge demo uses isolated disposable sessions instead.
+- arbitrary browser SQL
+- irreversible third-party writes
+- complete simulation of unknown external APIs
+- a universal database mutation language
+- authentication for the public challenge sandbox
 
 ## Two-year thesis
 
