@@ -18,6 +18,7 @@ function compileTargetQuery(plan: DeleteCustomersPlan, lock = false) {
   const params: unknown[] = [];
   let i = 1;
   const where: string[] = [`c.session_id = $${i++}`];
+
   if (plan.filters.chaos_case_only) {
     where.push('c.chaos_case = true');
   } else {
@@ -25,7 +26,10 @@ function compileTargetQuery(plan: DeleteCustomersPlan, lock = false) {
     where.push(`c.last_active_at < now() - ($${i++}::int * interval '1 day')`);
   }
   if (plan.filters.exclude_enterprise) where.push(`c.segment <> 'Enterprise'`);
-  if (plan.filters.exclude_active_subscriptions) where.push(`NOT EXISTS (SELECT 1 FROM foresee_subscriptions sx WHERE sx.session_id = c.session_id AND sx.customer_id = c.id AND sx.status = 'active')`);
+  if (plan.filters.exclude_active_subscriptions) {
+    where.push(`NOT EXISTS (SELECT 1 FROM foresee_subscriptions sx WHERE sx.session_id = c.session_id AND sx.customer_id = c.id AND sx.status = 'active')`);
+  }
+
   let sql = `${TARGET_SELECT} WHERE ${where.join(' AND ')} ORDER BY c.id`;
   if (plan.filters.limit) {
     params.push(plan.filters.limit);
@@ -58,14 +62,18 @@ async function aggregateState(client: PoolClient, sessionId: string): Promise<Ag
   `, [sessionId]);
   const row = result.rows[0];
   return {
-    customers: Number(row.customers), enterpriseCustomers: Number(row.enterprise_customers), mrr: Number(row.mrr),
-    activeSubscriptions: Number(row.active_subscriptions), accountSummaryEnterprise: Number(row.account_summary_enterprise),
+    customers: Number(row.customers),
+    enterpriseCustomers: Number(row.enterprise_customers),
+    mrr: Number(row.mrr),
+    activeSubscriptions: Number(row.active_subscriptions),
+    accountSummaryEnterprise: Number(row.account_summary_enterprise),
   };
 }
 
 async function deleteTargets(client: PoolClient, sessionId: string, targets: TargetCustomer[]) {
   if (!targets.length) return;
-  await client.query(`DELETE FROM foresee_customers WHERE session_id = $1 AND id = ANY($2::text[])`, [sessionId, targets.map(t => t.id)]);
+  const ids = targets.map(t => t.id);
+  await client.query(`DELETE FROM foresee_customers WHERE session_id = $1 AND id = ANY($2::text[])`, [sessionId, ids]);
 }
 
 export async function simulate(sessionId: string, plan: DeleteCustomersPlan): Promise<SimulationReport> {
@@ -73,6 +81,7 @@ export async function simulate(sessionId: string, plan: DeleteCustomersPlan): Pr
     await ensureSchema(client);
     await seedSession(client, sessionId);
     await audit(client, sessionId, 'SIMULATION_STARTED', { plan });
+
     let report!: SimulationReport;
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
     try {
@@ -94,10 +103,18 @@ export async function simulate(sessionId: string, plan: DeleteCustomersPlan): Pr
         notes: impact.notesAffected,
         estimatedRestoreOperations: impact.customersDeleted + targets.reduce((sum, t) => sum + t.active_subscription_count, 0) + targets.reduce((sum, t) => sum + t.open_ticket_count, 0) + impact.notesAffected,
       };
+
       await deleteTargets(client, sessionId, targets);
       const projectedRaw = await aggregateState(client, sessionId);
-      const projected: AggregateState = { ...projectedRaw, accountSummaryEnterprise: before.accountSummaryEnterprise };
-      const risk = calculateRisk({ impact, rollbackPlan } as never);
+
+      // Deliberately bounded world model: account_summary is not observed as a predicted dependency.
+      // This enables the deterministic failure test to demonstrate runtime divergence detection.
+      const projected: AggregateState = {
+        ...projectedRaw,
+        accountSummaryEnterprise: before.accountSummaryEnterprise,
+      };
+
+      const risk = calculateRisk({ impact, rollbackPlan });
       const violations = [
         ...(impact.activeSubscriptionsAffected > 0 ? ['ACTIVE_SUBSCRIPTION_TARGETED'] : []),
         ...(impact.enterpriseCustomersAffected > 0 ? ['ENTERPRISE_CUSTOMER_TARGETED'] : []),
@@ -107,22 +124,39 @@ export async function simulate(sessionId: string, plan: DeleteCustomersPlan): Pr
       const now = new Date();
       const expires = new Date(now.getTime() + 5 * 60_000);
       report = {
-        id: crypto.randomUUID(), sessionId, createdAt: now.toISOString(), expiresAt: expires.toISOString(), plan,
-        status: risk.level === 'HIGH' ? 'unsafe' : 'safe', risk: risk.level, riskReasons: risk.reasons,
-        confidence: confidence.score, confidenceSignals: confidence.signals,
+        id: crypto.randomUUID(),
+        sessionId,
+        createdAt: now.toISOString(),
+        expiresAt: expires.toISOString(),
+        plan,
+        status: risk.level === 'HIGH' ? 'unsafe' : 'safe',
+        risk: risk.level,
+        riskReasons: risk.reasons,
+        confidence: confidence.score,
+        confidenceSignals: confidence.signals,
         knownUnknowns: [
           'External integrations are not replayed in the transaction sandbox.',
           'Unknown database triggers can exist outside the observed dependency graph.',
           'Effects outside the measured business-state domains are not guaranteed.',
         ],
-        targets, before, projected, impact, rollbackPlan, policy: { allowed: violations.length === 0, violations }, fingerprint,
+        targets,
+        before,
+        projected,
+        impact,
+        rollbackPlan,
+        policy: { allowed: violations.length === 0, violations },
+        fingerprint,
       };
       await client.query('ROLLBACK');
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
     }
-    await client.query(`INSERT INTO foresee_simulation_runs(id, session_id, plan, report, fingerprint, expires_at, status) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7)`, [report.id, sessionId, JSON.stringify(plan), JSON.stringify(report), report.fingerprint, report.expiresAt, report.status]);
+
+    await client.query(`
+      INSERT INTO foresee_simulation_runs(id, session_id, plan, report, fingerprint, expires_at, status)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7)
+    `, [report.id, sessionId, JSON.stringify(plan), JSON.stringify(report), report.fingerprint, report.expiresAt, report.status]);
     await audit(client, sessionId, 'SIMULATION_COMPLETED', { simulationId: report.id, risk: report.risk, targets: report.targets.length });
     if (!report.policy.allowed) await audit(client, sessionId, 'POLICY_BLOCKED', { simulationId: report.id, violations: report.policy.violations });
     return report;
@@ -141,7 +175,10 @@ async function captureSnapshots(client: PoolClient, sessionId: string, execution
   for (const entry of tables) {
     const rows = await client.query(`SELECT * FROM ${entry.table} WHERE session_id = $1 AND ${entry.customerWhere}`, [sessionId, ids]);
     for (const row of rows.rows) {
-      await client.query(`INSERT INTO foresee_rollback_snapshots(session_id, execution_id, table_name, row_id, serialized_row, restore_order) VALUES ($1, $2, $3, $4, $5::jsonb, $6)`, [sessionId, executionId, entry.table, row[entry.id], JSON.stringify(row), entry.order]);
+      await client.query(`
+        INSERT INTO foresee_rollback_snapshots(session_id, execution_id, table_name, row_id, serialized_row, restore_order)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+      `, [sessionId, executionId, entry.table, row[entry.id], JSON.stringify(row), entry.order]);
     }
   }
 }
@@ -161,10 +198,12 @@ export async function executeSimulation(sessionId: string, simulationId: string)
       await audit(client, sessionId, 'EXECUTION_REFUSED', { simulationId, reason: 'policy_blocked' });
       return { status: 'blocked' as const, message: 'Policy blocks this plan. Apply a safe tweak and re-simulate.' };
     }
+
     const executionId = crypto.randomUUID();
     await client.query(`INSERT INTO foresee_execution_runs(id, session_id, simulation_id, status) VALUES ($1, $2, $3, 'running')`, [executionId, sessionId, simulationId]);
     await audit(client, sessionId, 'ACTION_APPROVED', { simulationId, executionId });
     await audit(client, sessionId, 'EXECUTION_STARTED', { simulationId, executionId });
+
     await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
     try {
       const targets = await loadTargets(client, sessionId, report.plan, true);
@@ -175,30 +214,46 @@ export async function executeSimulation(sessionId: string, simulationId: string)
         await audit(client, sessionId, 'STATE_FINGERPRINT_FAILED', { simulationId, executionId });
         return { status: 'stale' as const, executionId, message: 'State changed since simulation. Re-simulation required.' };
       }
+
       await captureSnapshots(client, sessionId, executionId, targets);
       const preExecution = await aggregateState(client, sessionId);
       await deleteTargets(client, sessionId, targets);
       const observed = await aggregateState(client, sessionId);
+
       const divergence: string[] = [];
       if (observed.customers !== report.projected.customers) divergence.push('customers');
       if (observed.enterpriseCustomers !== report.projected.enterpriseCustomers) divergence.push('enterprise_customers');
       if (observed.mrr !== report.projected.mrr) divergence.push('mrr');
       if (observed.activeSubscriptions !== report.projected.activeSubscriptions) divergence.push('active_subscriptions');
       if (observed.accountSummaryEnterprise !== report.projected.accountSummaryEnterprise) divergence.push('account_summary.enterprise_customers');
-      const orphanCheck = await client.query(`SELECT COUNT(*)::int AS n FROM foresee_subscriptions s LEFT JOIN foresee_customers c ON c.session_id=s.session_id AND c.id=s.customer_id WHERE s.session_id=$1 AND s.status='active' AND c.id IS NULL`, [sessionId]);
+
+      const orphanCheck = await client.query(`
+        SELECT COUNT(*)::int AS n
+        FROM foresee_subscriptions s
+        LEFT JOIN foresee_customers c ON c.session_id=s.session_id AND c.id=s.customer_id
+        WHERE s.session_id=$1 AND s.status='active' AND c.id IS NULL
+      `, [sessionId]);
       if (Number(orphanCheck.rows[0].n) > 0) divergence.push('active_subscription_orphan');
+
       if (divergence.length) {
         await client.query('ROLLBACK');
-        const result = { prediction: report.projected, observed, unexpected: divergence, safetyResponse: 'Transaction rolled back automatically', finalPersistentState: 'UNCHANGED' };
+        const result = {
+          prediction: report.projected,
+          observed,
+          unexpected: divergence,
+          safetyResponse: 'Transaction rolled back automatically',
+          finalPersistentState: 'UNCHANGED',
+        };
         await client.query(`UPDATE foresee_execution_runs SET status='auto_rolled_back', result=$2::jsonb, rolled_back_at=now() WHERE id=$1`, [executionId, JSON.stringify(result)]);
         await audit(client, sessionId, 'RUNTIME_DIVERGENCE', { simulationId, executionId, unexpected: divergence });
         await audit(client, sessionId, 'AUTO_ROLLBACK', { simulationId, executionId });
         return { status: 'auto_rolled_back' as const, executionId, ...result };
       }
-      await client.query('COMMIT');
+
       const result = { before: preExecution, observed, verified: true };
       await client.query(`UPDATE foresee_execution_runs SET status='committed', result=$2::jsonb, committed_at=now() WHERE id=$1`, [executionId, JSON.stringify(result)]);
       await audit(client, sessionId, 'EXECUTION_COMMITTED', { simulationId, executionId, customersDeleted: report.impact.customersDeleted });
+      await client.query('COMMIT');
       return { status: 'committed' as const, executionId, ...result };
     } catch (error) {
       try { await client.query('ROLLBACK'); } catch {}
@@ -214,26 +269,37 @@ export async function rollbackExecution(sessionId: string, executionId: string) 
     const execution = await client.query(`SELECT * FROM foresee_execution_runs WHERE id=$1 AND session_id=$2`, [executionId, sessionId]);
     if (!execution.rowCount) throw new Error('Execution not found.');
     if (execution.rows[0].status !== 'committed') throw new Error('Only committed executions can be manually rolled back.');
-    const snapshots = await client.query(`SELECT table_name, serialized_row, restore_order FROM foresee_rollback_snapshots WHERE execution_id=$1 AND session_id=$2 ORDER BY restore_order ASC, id ASC`, [executionId, sessionId]);
+
+    const snapshots = await client.query(`
+      SELECT table_name, serialized_row, restore_order
+      FROM foresee_rollback_snapshots
+      WHERE execution_id=$1 AND session_id=$2
+      ORDER BY restore_order ASC, id ASC
+    `, [executionId, sessionId]);
+
     await client.query('BEGIN');
     try {
       for (const snapshot of snapshots.rows) {
         const row = snapshot.serialized_row as Record<string, unknown>;
         switch (snapshot.table_name) {
           case 'foresee_customers':
-            await client.query(`INSERT INTO foresee_customers(session_id,id,name,email,status,last_active_at,created_at,updated_at,segment,chaos_case) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.name,row.email,row.status,row.last_active_at,row.created_at,row.updated_at,row.segment,row.chaos_case]); break;
+            await client.query(`INSERT INTO foresee_customers(session_id,id,name,email,status,last_active_at,created_at,updated_at,segment,chaos_case) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.name,row.email,row.status,row.last_active_at,row.created_at,row.updated_at,row.segment,row.chaos_case]);
+            break;
           case 'foresee_subscriptions':
-            await client.query(`INSERT INTO foresee_subscriptions(session_id,id,customer_id,plan,status,renewal_date,mrr) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.plan,row.status,row.renewal_date,row.mrr]); break;
+            await client.query(`INSERT INTO foresee_subscriptions(session_id,id,customer_id,plan,status,renewal_date,mrr) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.plan,row.status,row.renewal_date,row.mrr]);
+            break;
           case 'foresee_support_tickets':
-            await client.query(`INSERT INTO foresee_support_tickets(session_id,id,customer_id,status,priority) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.status,row.priority]); break;
+            await client.query(`INSERT INTO foresee_support_tickets(session_id,id,customer_id,status,priority) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.status,row.priority]);
+            break;
           case 'foresee_customer_notes':
-            await client.query(`INSERT INTO foresee_customer_notes(session_id,id,customer_id,content) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.content]); break;
+            await client.query(`INSERT INTO foresee_customer_notes(session_id,id,customer_id,content) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [row.session_id,row.id,row.customer_id,row.content]);
+            break;
           default: throw new Error('Snapshot table is not restorable.');
         }
       }
-      await client.query('COMMIT');
       await client.query(`UPDATE foresee_execution_runs SET status='manually_rolled_back', rolled_back_at=now() WHERE id=$1`, [executionId]);
       await audit(client, sessionId, 'MANUAL_ROLLBACK', { executionId, restoredRows: snapshots.rowCount });
+      await client.query('COMMIT');
       return { status: 'rolled_back' as const, executionId, restoredRows: snapshots.rowCount };
     } catch (error) {
       await client.query('ROLLBACK');
