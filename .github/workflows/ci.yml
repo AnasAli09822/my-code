@@ -20,3 +20,18 @@ jobs:
       - run: npm run typecheck
       - run: npm test -- --exclude tests/integration.test.ts
       - run: npm run build
+
+  live-e2e:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PLAYWRIGHT_BASE_URL: https://br-falling-hill-b5dguwdc-foresee.compute.c-7.us-east-2.aws.neon.tech
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
